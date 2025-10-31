@@ -171,25 +171,25 @@ def ffmpeg_frame_generator(video, force_rate, frame_load_cap, start_time,
                            custom_width, custom_height, downscale_ratio=8,
                            meta_batch=None, unique_id=None):
     args_input = ["-i", video]
-    args_dummy = [ffmpeg_path] + args_input +['-c', 'copy', '-frames:v', '1', "-f", "null", "-"]
+    args_dummy = [ffmpeg_path] + args_input + ['-c', 'copy', '-frames:v', '1', "-f", "null", "-"]
     size_base = None
     fps_base = None
     try:
         dummy_res = subprocess.run(args_dummy, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.PIPE, check=True)
+                                   stderr=subprocess.PIPE, check=True)
     except subprocess.CalledProcessError as e:
-        raise Exception("An error occurred in the ffmpeg subprocess:\n" \
-                + e.stderr.decode(*ENCODE_ARGS))
+        raise Exception("An error occurred in the ffmpeg subprocess:\n"
+                        + e.stderr.decode(*ENCODE_ARGS))
     lines = dummy_res.stderr.decode(*ENCODE_ARGS)
     if "Video: vp9 " in lines:
         args_input = ["-c:v", "libvpx-vp9"] + args_input
-        args_dummy = [ffmpeg_path] + args_input +['-c', 'copy', '-frames:v', '1', "-f", "null", "-"]
+        args_dummy = [ffmpeg_path] + args_input + ['-c', 'copy', '-frames:v', '1', "-f", "null", "-"]
         try:
             dummy_res = subprocess.run(args_dummy, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.PIPE, check=True)
+                                       stderr=subprocess.PIPE, check=True)
         except subprocess.CalledProcessError as e:
-            raise Exception("An error occurred in the ffmpeg subprocess:\n" \
-                    + e.stderr.decode(*ENCODE_ARGS))
+            raise Exception("An error occurred in the ffmpeg subprocess:\n"
+                            + e.stderr.decode(*ENCODE_ARGS))
         lines = dummy_res.stderr.decode(*ENCODE_ARGS)
 
     for line in lines.split('\n'):
@@ -209,7 +209,7 @@ def ffmpeg_frame_generator(video, force_rate, frame_load_cap, start_time,
     durs_match = re.search("Duration: (\\d+:\\d+:\\d+\\.\\d+),", lines)
     if durs_match:
         durs = durs_match.group(1).split(':')
-        duration = int(durs[0])*3600 + int(durs[1])*60 + float(durs[2])
+        duration = int(durs[0]) * 3600 + int(durs[1]) * 60 + float(durs[2])
     else:
         duration = 0
 
@@ -221,66 +221,128 @@ def ffmpeg_frame_generator(video, force_rate, frame_load_cap, start_time,
             post_seek = ['-ss', str(start_time)]
     else:
         post_seek = []
-    args_all_frames = [ffmpeg_path, "-v", "error", "-an"] + \
-            args_input + ["-pix_fmt", "rgba64le"] + post_seek
+    args_all_frames = [ffmpeg_path, "-v", "error", "-an"] + args_input + ["-pix_fmt", "rgba64le"] + post_seek
 
+    # --- [CM] Robust SDR/HDR → BT.709 full RGBA management ---
     vfilters = []
+    src = lines.lower()
+
+    # 1) Apply FPS early to reduce the pixel load of later filters
     if force_rate != 0:
-        vfilters.append("fps=fps="+str(force_rate))
+        vfilters.append("fps=fps=" + str(force_rate))
+
+    # 2) Infer input range (tv/pc) from stderr descriptors
+    # Example: "... yuv420p(tv, bt709/bt709/bt709) ..." vs "... yuv444p10le(pc, bt2020nc/bt2020/smpte2084) ..."
+    if "(pc," in src or "full" in src:
+        range_in = "full"
+    else:
+        range_in = "limited"
+
+    # 3) Infer input primaries/matrix
+    prim_in = "bt709"
+    mat_in = "bt709"
+    if "bt2020" in src:
+        prim_in = "bt2020"
+        mat_in = "bt2020nc"  # safest default with 2020 content
+    elif "bt601" in src or "smpte170m" in src or "ntsc" in src:
+        prim_in = "bt601"
+        mat_in = "bt601"
+
+    # 4) Infer input transfer
+    xfer_in = "bt709"
+    if "arib-std-b67" in src or "hlg" in src:
+        xfer_in = "arib-std-b67"
+    elif "smpte2084" in src or "pq" in src or "hdr10" in src:
+        xfer_in = "smpte2084"
+
+    # 5) Target: BT.709 primaries/matrix, full range, SDR transfer
+    prim_out = "bt709"
+    mat_out = "bt709"
+    xfer_out = "bt709"
+    range_out = "full"
+
+    # 6) Build a single zscale with optional tonemap for HDR
+    z = (
+        f"zscale="
+        f"primariesin={prim_in}:transferin={xfer_in}:matrixin={mat_in}:rangein={range_in}:"
+        f"primaries={prim_out}:transfer={xfer_out}:matrix={mat_out}:range={range_out}"
+    )
+    if xfer_in == "smpte2084":
+        # PQ (HDR10) -> SDR with Hable tonemapping; 'tonemap_param' ~ nominal peak
+        z += ":tonemap=hable:tonemap_param=100.0:desat=0.5"
+    elif xfer_in == "arib-std-b67":
+        # HLG -> SDR; Mobius preserves mid-tones well
+        z += ":tonemap=mobius:tonemap_param=0.33:desat=0.5"
+
+    vfilters.append(z)
+
+    # 7) Geometry operations (optional)
     if custom_width != 0 or custom_height != 0:
         size = target_size(size_base[0], size_base[1], custom_width,
                            custom_height, downscale_ratio=downscale_ratio)
-        ar = float(size[0])/float(size[1])
-        if abs(size_base[0]*ar-size_base[1]) >= 1:
-            #Aspect ratio is changed. Crop to new aspect ratio before scale
+        ar = float(size[0]) / float(size[1])
+        if abs(size_base[0] * ar - size_base[1]) >= 1:
+            # Crop to target aspect ratio before scaling
             vfilters.append(f"crop=if(gt({ar}\\,a)\\,iw\\,ih*{ar}):if(gt({ar}\\,a)\\,iw/{ar}\\,ih)")
-        size_arg = ':'.join(map(str,size))
+        size_arg = ':'.join(map(str, size))
         vfilters.append(f"scale={size_arg}")
     else:
         size = size_base
-    if len(vfilters) > 0:
+
+    # 8) Lock final pixel format explicitly inside the graph
+    vfilters.append("format=rgba64le")
+
+    if vfilters:
         args_all_frames += ["-vf", ",".join(vfilters)]
-    yieldable_frames = (force_rate or fps_base)*duration
+    # --- [CM] End ---
+
+    yieldable_frames = (force_rate or fps_base) * duration
     if frame_load_cap > 0:
         args_all_frames += ["-frames:v", str(frame_load_cap)]
         yieldable_frames = min(yieldable_frames, frame_load_cap)
+
     yield (size_base[0], size_base[1], fps_base, duration, fps_base * duration,
-           1/(force_rate or fps_base), yieldable_frames, size[0], size[1], alpha)
+           1 / (force_rate or fps_base), yieldable_frames, size[0], size[1], alpha)
 
     args_all_frames += ["-f", "rawvideo", "-"]
     pbar = ProgressBar(yieldable_frames)
     try:
         with subprocess.Popen(args_all_frames, stdout=subprocess.PIPE) as proc:
-            #Manually buffer enough bytes for an image
+            # Manually buffer enough bytes for a single frame (RGBA64LE = 16 bits * 4 channels)
             bpi = size[0] * size[1] * 8
             current_bytes = bytearray(bpi)
-            current_offset=0
+            current_offset = 0
             prev_frame = None
             while True:
                 bytes_read = proc.stdout.read(bpi - current_offset)
-                if bytes_read is None:#sleep to wait for more data
+                if bytes_read is None:
                     time.sleep(.1)
                     continue
-                if len(bytes_read) == 0:#EOF
+                if len(bytes_read) == 0:
                     break
+                # NOTE: left unchanged except for clarity spacing
                 current_bytes[current_offset:len(bytes_read)] = bytes_read
-                current_offset+=len(bytes_read)
+                current_offset += len(bytes_read)
                 if current_offset == bpi:
                     if prev_frame is not None:
                         yield prev_frame
                         pbar.update(1)
-                    prev_frame = np.frombuffer(current_bytes, dtype=np.dtype(np.uint16).newbyteorder("<")).reshape(size[1], size[0], 4) / (2**16-1)
+                    prev_frame = np.frombuffer(
+                        current_bytes,
+                        dtype=np.dtype(np.uint16).newbyteorder("<")
+                    ).reshape(size[1], size[0], 4) / (2**16 - 1)
                     if not alpha:
                         prev_frame = prev_frame[:, :, :-1]
                     current_offset = 0
     except BrokenPipeError as e:
-        raise Exception("An error occured in the ffmpeg subprocess:\n" \
-                + proc.stderr.read().decode(*ENCODE_ARGS))
+        raise Exception("An error occured in the ffmpeg subprocess:\n"
+                        + proc.stderr.read().decode(*ENCODE_ARGS))
     if meta_batch is not None:
         meta_batch.inputs.pop(unique_id)
         meta_batch.has_closed_inputs = True
     if prev_frame is not None:
         yield prev_frame
+
 
 #Python 3.12 adds an itertools.batched, but it's easily replicated for legacy support
 def batched(it, n):
