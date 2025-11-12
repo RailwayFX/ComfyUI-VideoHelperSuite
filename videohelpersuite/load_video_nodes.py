@@ -225,57 +225,55 @@ def ffmpeg_frame_generator(video, force_rate, frame_load_cap, start_time,
             args_input + ["-pix_fmt", "rgba64le"] + post_seek
 
     vfilters = []
-    src = lines.lower()
+    # --- [Color Management] Use ONLY the matched video stream line ---
+    src = line.lower()  # not the whole stderr
 
-    # --- [Color Managment] Robust SDR/HDR → BT.709 full RGBA management ---
-    # Apply FPS early to reduce the pixel load of later filters
+    # Apply FPS early (unchanged)
     if force_rate != 0:
         vfilters.append("fps=fps=" + str(force_rate))
 
-    # Infer input range (tv/pc) from stderr descriptors
-    # Example: "... yuv420p(tv, bt709/bt709/bt709) ..." vs "... yuv444p10le(pc, bt2020nc/bt2020/smpte2084) ..."
-    if "(pc," in src or "full" in src:
+    # Range: explicit PC or YUVJ => full, otherwise limited
+    if "(pc," in src or re.search(r"\byuvj\d+p\b", src):
         range_in = "full"
     else:
         range_in = "limited"
 
-    # Infer input primaries/matrix
+    # Primaries/matrix: default to BT.709 unless 2020/601 is explicitly found
     prim_in = "bt709"
     mat_in = "bt709"
     if "bt2020" in src:
         prim_in = "bt2020"
-        mat_in = "bt2020nc"  # safest default with 2020 content
-    elif "bt601" in src or "smpte170m" in src or "ntsc" in src:
+        mat_in = "bt2020nc"
+    elif "bt601" in src or "smpte170m" in src or "ntsc" in src or "bt470" in src:
         prim_in = "bt601"
         mat_in = "bt601"
 
-    # Infer input transfer
+    # Transfer: default SDR unless HLG/PQ is explicitly found
     xfer_in = "bt709"
     if "arib-std-b67" in src or "hlg" in src:
         xfer_in = "arib-std-b67"
-    elif "smpte2084" in src or "pq" in src or "hdr10" in src:
+    elif "smpte2084" in src or re.search(r"\bpq\b", src):
         xfer_in = "smpte2084"
 
-    # Target: BT.709 primaries/matrix, full range, SDR transfer
+    # Target: BT.709 primaries/matrix, SDR transfer, full range RGBA
     prim_out = "bt709"
     mat_out = "bt709"
     xfer_out = "bt709"
     range_out = "full"
 
-    # Build a single zscale with optional tonemap for HDR
+    # Single zscale, with tonemap only for HDR inputs
     z = (
         f"zscale="
         f"primariesin={prim_in}:transferin={xfer_in}:matrixin={mat_in}:rangein={range_in}:"
         f"primaries={prim_out}:transfer={xfer_out}:matrix={mat_out}:range={range_out}"
     )
     if xfer_in == "smpte2084":
-        # PQ (HDR10) -> SDR with Hable tonemapping; 'tonemap_param' ~ nominal peak
         z += ":tonemap=hable:tonemap_param=100.0:desat=0.5"
     elif xfer_in == "arib-std-b67":
-        # HLG -> SDR; Mobius preserves mid-tones well
         z += ":tonemap=mobius:tonemap_param=0.33:desat=0.5"
 
     vfilters.append(z)
+
 
     if custom_width != 0 or custom_height != 0:
         size = target_size(size_base[0], size_base[1], custom_width,
